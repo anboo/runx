@@ -1,0 +1,49 @@
+# RunX launch config: frontend + backend stack.
+#
+# Usage:
+#   runx up examples/webapp.yaml     # pre_steps + start all processes
+#   runx down webapp                 # stop everything from this config
+#
+# Schema:
+#   name        required, unique id; processes are named <name>.<process>
+#   root        optional base dir; defaults to this file's directory. A
+#               relative value resolves against this file's directory.
+#   env         global env for all pre_steps and processes
+#   pre_steps   one-shot commands, run sequentially BEFORE processes start
+#   processes   long-running commands, started in parallel
+name: webapp
+
+env:
+  NODE_ENV: development
+
+pre_steps:
+  - name: postgres
+    cwd: ./infra
+    command: docker compose up -d
+    timeout: 120s
+
+  - name: migrate
+    cwd: ./backend
+    command: make
+    args: [migrate]
+    ignore_errors: true
+
+processes:
+  - name: backend
+    cwd: ./backend
+    command: go
+    args: [run, .]
+    env:
+      PORT: "8080"
+      DATABASE_URL: postgres://localhost:5432/app
+    health:
+      url: http://localhost:8080/health
+      timeout: 30s
+      interval: 1s
+
+  - name: frontend
+    cwd: ./frontend
+    command: npm
+    args: [run, dev]
+    env:
+      VITE_API_URL: http://localhost:8080

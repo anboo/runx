@@ -6,6 +6,7 @@ import (
 
 	"runx/internal/cli"
 	"runx/internal/daemon"
+	"runx/internal/mcp"
 	"runx/internal/tui"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -44,6 +45,9 @@ func main() {
 	case "metrics":
 		app.Metrics(args)
 
+	case "ports":
+		app.Ports(args)
+
 	case "events":
 		app.Events(args)
 
@@ -62,10 +66,22 @@ func main() {
 	case "gc":
 		app.GC(args)
 
+	case "up":
+		app.Up(args)
+
+	case "down":
+		app.Down(args)
+
 	case "daemon":
 		d := daemon.New()
 		if err := d.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Daemon error: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "mcp":
+		if err := mcp.Serve(); err != nil {
+			fmt.Fprintf(os.Stderr, "MCP error: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -102,18 +118,24 @@ Commands:
   ps        List processes
   logs      View process logs
   metrics   View process metrics
+  ports     List listening ports and connections of a process tree
   events    View process events
   attach    Attach to a process
   exec      Execute a command in process context
   shell     Open a shell in process directory
   wait      Wait for a process to finish
   gc        Clean up dead processes and old data
+  up        Launch a stack from a YAML config (pre_steps + processes)
+  down      Stop all processes of a launched config
   dashboard Open the terminal dashboard
   daemon    Start the background daemon
+  mcp       Serve the MCP process-manager toolset over stdio
 
 Examples:
   runx start backend --cwd ./backend -- go run .
   runx start frontend --cwd ./frontend -- npm run dev
+  runx up dev.yaml
+  runx down dev
   runx ps --json
   runx logs backend --json
   runx metrics backend

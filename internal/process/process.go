@@ -22,15 +22,15 @@ const (
 type EventType string
 
 const (
-	EventStarted        EventType = "started"
-	EventReady          EventType = "ready"
-	EventStopped        EventType = "stopped"
-	EventRestarted      EventType = "restarted"
-	EventExited         EventType = "exited"
-	EventKilled         EventType = "killed"
-	EventHealthFailed   EventType = "health_failed"
+	EventStarted         EventType = "started"
+	EventReady           EventType = "ready"
+	EventStopped         EventType = "stopped"
+	EventRestarted       EventType = "restarted"
+	EventExited          EventType = "exited"
+	EventKilled          EventType = "killed"
+	EventHealthFailed    EventType = "health_failed"
 	EventHealthRecovered EventType = "health_recovered"
-	EventLogOutput      EventType = "log_output"
+	EventLogOutput       EventType = "log_output"
 )
 
 type Event struct {
@@ -47,19 +47,19 @@ type LogEntry struct {
 }
 
 type MetricsSnapshot struct {
-	CPU           float64 `json:"cpu"`
-	Memory        uint64  `json:"memory"`
-	RSS           uint64  `json:"rss"`
-	VirtualMemory uint64  `json:"virtual_memory"`
-	Threads       int32   `json:"threads"`
-	FDCount       int     `json:"fd_count"`
-	NetworkRX     uint64  `json:"network_rx"`
-	NetworkTX     uint64  `json:"network_tx"`
-	DiskRead      uint64  `json:"disk_read"`
-	DiskWrite     uint64  `json:"disk_write"`
-	IOWait        float64 `json:"io_wait"`
-	ContextSwitches int64 `json:"context_switches"`
-	Timestamp     int64   `json:"timestamp"`
+	CPU             float64 `json:"cpu"`
+	Memory          uint64  `json:"memory"`
+	RSS             uint64  `json:"rss"`
+	VirtualMemory   uint64  `json:"virtual_memory"`
+	Threads         int32   `json:"threads"`
+	FDCount         int     `json:"fd_count"`
+	NetworkRX       uint64  `json:"network_rx"`
+	NetworkTX       uint64  `json:"network_tx"`
+	DiskRead        uint64  `json:"disk_read"`
+	DiskWrite       uint64  `json:"disk_write"`
+	IOWait          float64 `json:"io_wait"`
+	ContextSwitches int64   `json:"context_switches"`
+	Timestamp       int64   `json:"timestamp"`
 }
 
 type ProcessInfo struct {
@@ -74,14 +74,24 @@ type ProcessInfo struct {
 	StartedAt     *time.Time       `json:"started_at,omitempty"`
 	FinishedAt    *time.Time       `json:"finished_at,omitempty"`
 	ExitCode      *int             `json:"exit_code,omitempty"`
-	Color         string           `json:"color"`
-	RestartCount  int              `json:"restart_count"`
-	TTL           time.Duration    `json:"ttl,omitempty"`
-	Ephemeral     bool             `json:"ephemeral"`
-	IdleTimeout   time.Duration    `json:"idle_timeout,omitempty"`
-	Events        []Event          `json:"events"`
-	Metrics       *MetricsSnapshot `json:"metrics,omitempty"`
-	Uptime        string           `json:"uptime,omitempty"`
+	// ExitSignal is set when the process was terminated by a signal (e.g. SIGKILL).
+	ExitSignal string `json:"exit_signal,omitempty"`
+	// LastError carries the failure reason (exec error, crash, stop/kill) so
+	// UIs and agents can show why a process is not running.
+	LastError    string           `json:"last_error,omitempty"`
+	Color        string           `json:"color"`
+	RestartCount int              `json:"restart_count"`
+	TTL          time.Duration    `json:"ttl,omitempty"`
+	Ephemeral    bool             `json:"ephemeral"`
+	IdleTimeout  time.Duration    `json:"idle_timeout,omitempty"`
+	// Health is the attached readiness probe, if any.
+	Health *HealthCheck `json:"health,omitempty"`
+	// Healthy is the last known probe result (true once the first probe
+	// succeeds; false when the probe is failing or not yet probed).
+	Healthy bool `json:"healthy"`
+	Events  []Event          `json:"events"`
+	Metrics *MetricsSnapshot `json:"metrics,omitempty"`
+	Uptime  string           `json:"uptime,omitempty"`
 }
 
 var ProcessColors = []string{

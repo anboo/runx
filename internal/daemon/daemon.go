@@ -3,6 +3,9 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"runx/internal/process"
@@ -84,18 +87,32 @@ func IsRunning() bool {
 	return true
 }
 
+// Spawn starts the background daemon from the runx binary. The daemon is
+// launched as `<executable> daemon`, so the current executable must
+// understand that command.
+//
+// A GUI binary (runx-gui) does NOT: it would spawn endless copies of itself,
+// each of which tries to spawn another one. When called from such a binary,
+// Spawn falls back to a real `runx` from PATH instead.
 func Spawn() error {
 	if IsRunning() {
 		return nil
 	}
 
-	home, _ := os.UserHomeDir()
-	os.MkdirAll(home+"/.runx", 0755)
-
 	execPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("executable: %w", err)
 	}
+	if isGUIExecutable(execPath) {
+		if p, err := exec.LookPath("runx"); err == nil {
+			execPath = p
+		} else {
+			return fmt.Errorf("daemon: cannot start from GUI binary and `runx` is not in PATH (start the daemon manually: runx daemon)")
+		}
+	}
+
+	home, _ := os.UserHomeDir()
+	os.MkdirAll(home+"/.runx", 0755)
 
 	nullFile, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
@@ -112,6 +129,13 @@ func Spawn() error {
 	_ = pid
 
 	return waitForSocket(10 * time.Second)
+}
+
+// isGUIExecutable reports whether the given binary is the Wails desktop app,
+// which must never be used to start the daemon (it would recurse).
+func isGUIExecutable(path string) bool {
+	base := strings.TrimSuffix(filepath.Base(path), ".exe")
+	return strings.HasSuffix(base, "-gui") || strings.HasSuffix(base, "gui")
 }
 
 func waitForSocket(timeout time.Duration) error {

@@ -13,9 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"runx/internal/daemon"
-	"runx/internal/socket"
 	"golang.org/x/term"
+	"runx/internal/daemon"
+	"runx/internal/launch"
+	"runx/internal/socket"
 )
 
 type CLI struct{}
@@ -88,21 +89,6 @@ done:
 	}
 
 	client := socket.NewClient()
-
-	procsRaw, _ := client.GetProcesses()
-	var procs []struct {
-		ID     string `json:"id"`
-		Name   string `json:"name"`
-		Status string `json:"status"`
-	}
-	if json.Unmarshal(procsRaw, &procs) == nil {
-		for _, p := range procs {
-			if p.Name == name && p.Status == "running" {
-				fmt.Fprintf(os.Stderr, "killing existing %s (%s)\n", p.ID, p.Status)
-				client.KillProcess(p.ID)
-			}
-		}
-	}
 
 	resp, err := client.StartProcess(name, absCwd, cmdArgs[0], cmdArgs[1:], nil, ttl, ephemeral, idle)
 	if err != nil {
@@ -199,14 +185,14 @@ func (c *CLI) PS(args []string) {
 	}
 
 	var procs []struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		PID     int    `json:"pid"`
-		Status  string `json:"status"`
+		ID      string  `json:"id"`
+		Name    string  `json:"name"`
+		PID     int     `json:"pid"`
+		Status  string  `json:"status"`
 		CPU     float64 `json:"cpu"`
-		Memory  uint64 `json:"memory"`
-		Uptime  string `json:"uptime"`
-		Command string `json:"command"`
+		Memory  uint64  `json:"memory"`
+		Uptime  string  `json:"uptime"`
+		Command string  `json:"command"`
 	}
 	json.Unmarshal(resp, &procs)
 
@@ -294,6 +280,77 @@ func (c *CLI) Logs(args []string) {
 	}
 }
 
+// Ports prints the listening ports and network connections of a process tree.
+func (c *CLI) Ports(args []string) {
+	if err := c.ensureDaemon(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: process id required")
+		os.Exit(1)
+	}
+
+	client := socket.NewClient()
+	resp, err := client.GetProcessDetail(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	var detail struct {
+		Tree        []struct {
+			PID   int    `json:"pid"`
+			PPID  int    `json:"ppid"`
+			CMD   string `json:"cmd"`
+			State string `json:"state"`
+		} `json:"tree"`
+		Ports []struct {
+			Proto string `json:"proto"`
+			Addr  string `json:"addr"`
+			Port  int    `json:"port"`
+		} `json:"ports"`
+		Connections []struct {
+			Proto  string `json:"proto"`
+			Local  string `json:"local"`
+			Remote string `json:"remote"`
+			State  string `json:"state"`
+			Count  int    `json:"count"`
+		} `json:"connections"`
+	}
+	if err := json.Unmarshal(resp, &detail); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Process tree:")
+	for _, n := range detail.Tree {
+		fmt.Printf("  pid %-7d ppid %-7d [%s] %s\n", n.PID, n.PPID, n.State, truncate(n.CMD, 70))
+	}
+
+	if len(detail.Ports) == 0 {
+		fmt.Println("\nListening ports: none")
+	} else {
+		fmt.Println("\nListening ports:")
+		for _, p := range detail.Ports {
+			addr := p.Addr
+			if addr == "" || addr == "*" || addr == "0.0.0.0" {
+				addr = "*"
+			}
+			fmt.Printf("  %s://%s:%d\n", p.Proto, addr, p.Port)
+		}
+	}
+
+	if len(detail.Connections) == 0 {
+		fmt.Println("\nConnections: none")
+	} else {
+		fmt.Println("\nConnections:")
+		for _, c := range detail.Connections {
+			fmt.Printf("  %-12s %-24s -> %-24s x%d\n", c.State, c.Local, c.Remote, c.Count)
+		}
+	}
+}
+
 func (c *CLI) Metrics(args []string) {
 	if err := c.ensureDaemon(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -339,17 +396,17 @@ func (c *CLI) Metrics(args []string) {
 	}
 
 	var m struct {
-		CPU      float64 `json:"cpu"`
-		Memory   uint64  `json:"memory"`
-		RSS      uint64  `json:"rss"`
-		VMem     uint64  `json:"virtual_memory"`
-		Threads  int32   `json:"threads"`
-		FDCount  int     `json:"fd_count"`
-		NetRX    uint64  `json:"network_rx"`
-		NetTX    uint64  `json:"network_tx"`
-		DiskRead uint64  `json:"disk_read"`
-		DiskWrite uint64 `json:"disk_write"`
-		IOWait   float64 `json:"io_wait"`
+		CPU       float64 `json:"cpu"`
+		Memory    uint64  `json:"memory"`
+		RSS       uint64  `json:"rss"`
+		VMem      uint64  `json:"virtual_memory"`
+		Threads   int32   `json:"threads"`
+		FDCount   int     `json:"fd_count"`
+		NetRX     uint64  `json:"network_rx"`
+		NetTX     uint64  `json:"network_tx"`
+		DiskRead  uint64  `json:"disk_read"`
+		DiskWrite uint64  `json:"disk_write"`
+		IOWait    float64 `json:"io_wait"`
 	}
 	if err := json.Unmarshal(resp, &m); err != nil {
 		fmt.Println(string(resp))
@@ -501,8 +558,8 @@ func (c *CLI) Shell(args []string) {
 	}
 
 	var procInfo struct {
-		CWD  string   `json:"cwd"`
-		Env  []string `json:"env"`
+		CWD string   `json:"cwd"`
+		Env []string `json:"env"`
 	}
 	if err := json.Unmarshal(resp, &procInfo); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -576,6 +633,114 @@ func (c *CLI) Wait(args []string) {
 
 type procStatus struct {
 	Status string `json:"status"`
+}
+
+// Up launches a stack described by a YAML config: pre_steps first, then all
+// processes through the daemon.
+func (c *CLI) Up(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: runx up <config.yaml>")
+		os.Exit(1)
+	}
+
+	cfg, err := launch.Load(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Config %q: %d pre_steps, %d processes\n", cfg.Name, len(cfg.PreSteps), len(cfg.Processes))
+
+	if err := c.ensureDaemon(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(cfg.PreSteps) > 0 {
+		fmt.Println("Running pre_steps...")
+		if err := launch.RunPreSteps(cfg, launch.RunOptions{Out: os.Stdout}); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	client := socket.NewClient()
+	started, err := launch.StartProcesses(cfg, socket.Starter{Client: client})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	for _, p := range cfg.Processes {
+		if p.Health == nil {
+			continue
+		}
+		name := cfg.ProcessName(p)
+		fmt.Printf("waiting for %s (%s) ...\n", name, p.Health.URL)
+		if err := launch.WaitHealthy(p.Health); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		} else {
+			fmt.Printf("%s is healthy\n", name)
+		}
+		// Keep monitoring in the daemon so the GUI and MCP see the process
+		// turn unhealthy (port collision, crash-loop) instead of looking fine.
+		if _, err := client.SetHealth(name, *socket.HealthFromLaunch(p.Health)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: enable health monitoring for %s: %v\n", name, err)
+		}
+	}
+
+	fmt.Printf("Up: %d processes started\n", len(started))
+	for _, s := range started {
+		fmt.Printf("  %s (id %s)\n", s.Name, s.ID)
+	}
+}
+
+// Down stops every process belonging to a config name. Matches both the exact
+// config name and the <config>.<process> prefixed names.
+func (c *CLI) Down(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: runx down <config-name>")
+		os.Exit(1)
+	}
+	if err := c.ensureDaemon(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	name := args[0]
+	prefix := name + "."
+	client := socket.NewClient()
+	resp, err := client.GetProcesses()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	var procs []struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(resp, &procs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	stopped := 0
+	for _, p := range procs {
+		if p.Name != name && !strings.HasPrefix(p.Name, prefix) {
+			continue
+		}
+		if p.Status == "running" || p.Status == "starting" {
+			if _, err := client.StopProcess(p.ID); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: stop %s: %v\n", p.ID, err)
+				continue
+			}
+			fmt.Printf("stopped %s\n", p.Name)
+			stopped++
+		}
+	}
+	fmt.Printf("Down: %d processes stopped\n", stopped)
 }
 
 func (c *CLI) GC(args []string) {

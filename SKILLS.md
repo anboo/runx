@@ -1,5 +1,21 @@
 # RunX Skill for AI Agents
 
+## MCP Toolset (preferred)
+
+If your client has the runx MCP server configured (`runx mcp` over stdio),
+use the `process_*` tools instead of shell backgrounding:
+
+- `process_start` - start a managed process (daemon-owned, non-blocking)
+- `process_wait_port` / `process_wait_url` / `process_wait_status` - wait for readiness instead of `sleep`+curl loops
+- `process_wait_log` - wait for a specific line in the output (regex)
+- `process_wait_exit` - wait for a job to finish, returns exit code
+- `process_logs` / `process_events` - read output and lifecycle timeline with `since` cursors
+- `process_stop` / `process_kill` / `process_restart` / `process_gc` - control and cleanup
+
+Never use `nohup`, `setsid`, `disown` or `< /dev/null > log 2>&1 &`: the daemon
+already detaches processes and kills them by pid from its own state (no
+`pkill -f` pattern matching).
+
 ## Primary Use Case: Start App -> Test Endpoints
 
 Before an AI agent can test endpoints with curl/gcurl, it needs the application running. RunX starts the app as a managed background process, so the agent can:

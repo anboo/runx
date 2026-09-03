@@ -1,1 +1,11 @@
+.idea/
+runx-gui
+.opencode
 runx
+
+# GUI build artifacts
+cmd/runx-gui/build/
+cmd/runx-gui/bin/
+cmd/runx-gui/frontend/dist/
+cmd/runx-gui/frontend/node_modules/
+cmd/runx-gui/frontend/wailsjs/

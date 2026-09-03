@@ -18,11 +18,12 @@ import (
 )
 
 type Manager struct {
-	mu        sync.RWMutex
-	processes map[string]*ManagedProcess
-	events    []Event
-	eventMu   sync.RWMutex
-	onChange  func()
+	mu         sync.RWMutex
+	processes  map[string]*ManagedProcess
+	events     []Event
+	eventMu    sync.RWMutex
+	onChange   func()
+	onChangeMu sync.RWMutex
 }
 
 type ManagedProcess struct {
@@ -35,19 +36,29 @@ type ManagedProcess struct {
 	stderrBuf *RingBuffer
 	cancel    context.CancelFunc
 	done      chan struct{}
-	mu        sync.RWMutex
+	// lastOutput is the wall clock of the most recent log line; drives the
+	// idle_timeout monitor.
+	lastOutput time.Time
+	mu         sync.RWMutex
+}
+
+// touch records that the process produced output.
+func (p *ManagedProcess) touch() {
+	p.mu.Lock()
+	p.lastOutput = time.Now()
+	p.mu.Unlock()
 }
 
 func (m *Manager) SetOnChange(fn func()) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.onChangeMu.Lock()
+	defer m.onChangeMu.Unlock()
 	m.onChange = fn
 }
 
 func (m *Manager) notifyChange() {
-	m.mu.RLock()
+	m.onChangeMu.RLock()
 	fn := m.onChange
-	m.mu.RUnlock()
+	m.onChangeMu.RUnlock()
 	if fn != nil {
 		fn()
 	}
@@ -60,6 +71,10 @@ func NewManager() *Manager {
 }
 
 func (m *Manager) Start(name, cwd, command string, args []string, env []string, ttl time.Duration, ephemeral bool, idleTimeout time.Duration) (*ManagedProcess, error) {
+	// Replacing an existing process with the same name: stop it and remove it
+	// so a name never maps to more than one live process.
+	m.replaceByName(name)
+
 	id := fmt.Sprintf("%s-%s", name, generateID()[:6])
 
 	absCwd, err := filepath.Abs(cwd)
@@ -88,11 +103,13 @@ func (m *Manager) Start(name, cwd, command string, args []string, env []string, 
 		stderrBuf: NewRingBuffer(10000),
 		cancel:    cancel,
 		done:      make(chan struct{}),
+		lastOutput: time.Now(),
 	}
 
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = absCwd
 	cmd.Env = append(os.Environ(), env...)
+	setProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -151,6 +168,10 @@ func (m *Manager) Start(name, cwd, command string, args []string, env []string, 
 		}()
 	}
 
+	if idleTimeout > 0 {
+		go m.monitorIdle(p, idleTimeout)
+	}
+
 	go func() {
 		err := cmd.Wait()
 		finish := time.Now()
@@ -160,9 +181,20 @@ func (m *Manager) Start(name, cwd, command string, args []string, env []string, 
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				code := exitErr.ExitCode()
 				p.ExitCode = &code
+				// A signal death (SIGTERM/SIGKILL/...) carries no exit code;
+				// record which signal killed it.
+				if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+					p.ExitSignal = ws.Signal().String()
+				}
+				if p.ExitSignal != "" {
+					p.LastError = fmt.Sprintf("terminated by signal %s", p.ExitSignal)
+				} else {
+					p.LastError = fmt.Sprintf("exited with code %d", code)
+				}
 			} else {
 				code := 1
 				p.ExitCode = &code
+				p.LastError = err.Error()
 			}
 		} else {
 			code := 0
@@ -172,15 +204,23 @@ func (m *Manager) Start(name, cwd, command string, args []string, env []string, 
 		p.mu.Unlock()
 		close(p.done)
 
+		msg := fmt.Sprintf("exited with code %d", *p.ExitCode)
+		if p.ExitSignal != "" {
+			msg = fmt.Sprintf("killed by signal %s", p.ExitSignal)
+		}
 		m.addEvent(Event{
 			Type:      EventExited,
 			ProcessID: id,
-			Message:   fmt.Sprintf("exited with code %d", *p.ExitCode),
+			Message:   msg,
 			Timestamp: finish.UnixMilli(),
 		})
 	}()
 
 	m.notifyChange()
+	// Metrics collection always runs, regardless of how the process was
+	// started (socket /start, restart, stack launch). Kept here so a
+	// restarted process does not silently lose its metrics goroutine.
+	go CollectMetrics(p)
 	return p, nil
 }
 
@@ -198,6 +238,42 @@ func (m *Manager) readOutput(p *ManagedProcess, r io.Reader, stream string) {
 		} else {
 			p.stderrBuf.Append(entry)
 		}
+		p.touch()
+	}
+}
+
+// monitorIdle stops the process when it produces no output for the idle
+// timeout. The clock starts at spawn and is reset by every log line.
+func (m *Manager) monitorIdle(p *ManagedProcess, idle time.Duration) {
+	interval := idle / 2
+	if interval < 500*time.Millisecond {
+		interval = 500 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		p.mu.RLock()
+		status := p.Status
+		last := p.lastOutput
+		p.mu.RUnlock()
+
+		if status != StatusRunning && status != StatusStarting {
+			return
+		}
+		if time.Since(last) > idle {
+			p.mu.RLock()
+			pid := p.ID
+			p.mu.RUnlock()
+			m.addEvent(Event{
+				Type:      EventStopped,
+				ProcessID: pid,
+				Message:   fmt.Sprintf("stopped: idle for %s", idle),
+				Timestamp: time.Now().UnixMilli(),
+			})
+			_ = m.Stop(pid)
+			return
+		}
 	}
 }
 
@@ -214,8 +290,18 @@ func (m *Manager) Stop(id string) error {
 	}
 	p.mu.Unlock()
 
-	p.cmd.Process.Signal(syscall.SIGTERM)
-	p.cancel()
+	// Ask the whole process tree to shut down, then force-kill leftovers.
+	signalTree(p, syscall.SIGTERM)
+	select {
+	case <-p.done:
+	case <-time.After(3 * time.Second):
+		signalTree(p, syscall.SIGKILL)
+		p.cancel()
+		select {
+		case <-p.done:
+		case <-time.After(2 * time.Second):
+		}
+	}
 
 	m.addEvent(Event{
 		Type:      EventStopped,
@@ -234,7 +320,7 @@ func (m *Manager) Kill(id string) error {
 		return fmt.Errorf("process %s not found", id)
 	}
 
-	p.cmd.Process.Kill()
+	signalTree(p, syscall.SIGKILL)
 	p.cancel()
 
 	now := time.Now()
@@ -243,6 +329,8 @@ func (m *Manager) Kill(id string) error {
 	p.FinishedAt = &now
 	code := -1
 	p.ExitCode = &code
+	p.ExitSignal = "SIGKILL"
+	p.LastError = "killed via SIGKILL"
 	p.mu.Unlock()
 
 	m.addEvent(Event{
@@ -272,26 +360,19 @@ func (m *Manager) Restart(id string) error {
 	ephemeral := p.Ephemeral
 	idle := p.IdleTimeout
 	restartCount := p.RestartCount + 1
+	oldID := p.ID
 	p.mu.Unlock()
 
-	m.Stop(p.ID)
-	select {
-	case <-p.done:
-	case <-time.After(5 * time.Second):
-	}
+	m.Stop(oldID)
 
+	// Start already replaces any process with the same name, so the old
+	// instance is dropped from the map here and the new one takes its place.
 	newP, err := m.Start(name, cwd, cmd, args, env, ttl, ephemeral, idle)
 	if err != nil {
 		return fmt.Errorf("restart: %w", err)
 	}
 
 	newP.RestartCount = restartCount
-
-	m.mu.Lock()
-	oldID := p.ID
-	delete(m.processes, oldID)
-	m.processes[newP.ID] = newP
-	m.mu.Unlock()
 
 	m.addEvent(Event{
 		Type:      EventRestarted,
@@ -536,6 +617,25 @@ func (m *Manager) eventsByProcess(id string, n int) []Event {
 	return res
 }
 
+// replaceByName stops and removes every process with the given name so that
+// start always ends up with a single live instance. It is safe to call with
+// no processes under that name.
+func (m *Manager) replaceByName(name string) {
+	m.mu.RLock()
+	var stale []string
+	for id, p := range m.processes {
+		if p.Name == name {
+			stale = append(stale, id)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, id := range stale {
+		_ = m.Stop(id)
+		m.Remove(id)
+	}
+}
+
 func (m *Manager) findProcess(id string) *ManagedProcess {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -575,6 +675,17 @@ func (m *Manager) FindAllByName(name string) []ProcessInfo {
 }
 
 func (m *Manager) GC() []string {
+	return m.gc(false)
+}
+
+// GCForce removes every finished process record (exited/killed/failed)
+// regardless of age or ephemeral flag. Used by the MCP process_gc tool where
+// the caller explicitly asks to clean up.
+func (m *Manager) GCForce() []string {
+	return m.gc(true)
+}
+
+func (m *Manager) gc(force bool) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -587,7 +698,7 @@ func (m *Manager) GC() []string {
 		p.mu.RUnlock()
 
 		if status == StatusExited || status == StatusKilled || status == StatusFailed {
-			if ephemeral || (finished != nil && time.Since(*finished) > 5*time.Minute) {
+			if force || ephemeral || (finished != nil && time.Since(*finished) > 5*time.Minute) {
 				delete(m.processes, id)
 				removed = append(removed, id)
 			}
@@ -624,7 +735,7 @@ func (m *Manager) Shutdown() {
 		status := p.Status
 		p.mu.RUnlock()
 		if status == StatusRunning || status == StatusStarting {
-			p.cmd.Process.Kill()
+			signalTree(p, syscall.SIGKILL)
 		}
 	}
 }
